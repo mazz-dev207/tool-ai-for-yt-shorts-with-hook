@@ -21,6 +21,7 @@ from src.retention.hooks import select_voiceover_hook
 from src.voiceover.mixer import probe_video, choose_teaser_range, mix_voiceover_hook
 from src.voiceover.tts import create_tts_provider, fit_audio_to_max_duration
 from src.voiceover.base import approximate_word_timings
+from src.voiceover.sfx import select_intro_sfx
 
 
 def _load_json(path: Path):
@@ -117,6 +118,14 @@ def apply_voiceover_hooks(video_name: str):
                 fitted_duration,
             )
 
+            intro_sfx = select_intro_sfx(clip, hook)
+            if intro_sfx:
+                info(
+                    "Intro SFX "
+                    f"{index}: "
+                    + " + ".join(item["path"].name for item in intro_sfx)
+                )
+
             mixed_path = voice_dir / f"clip_{index}_hooked.mp4"
             mix_voiceover_hook(
                 video_path=video_path,
@@ -127,9 +136,19 @@ def apply_voiceover_hooks(video_name: str):
                 teaser_end=teaser_end,
                 ducking_volume=VOICEOVER_DUCKING_VOLUME,
                 fade_duration=VOICEOVER_AUDIO_FADE,
+                intro_sfx=intro_sfx,
             )
 
             os.replace(mixed_path, video_path)
+
+            sfx_metadata = [
+                {
+                    "file": item["path"].name,
+                    "delay": round(float(item.get("delay", 0.0)), 3),
+                    "category": item.get("category", "general"),
+                }
+                for item in intro_sfx
+            ]
 
             metadata = {
                 "enabled": True,
@@ -142,6 +161,7 @@ def apply_voiceover_hooks(video_name: str):
                 "provider": tts.provider,
                 "voice": tts.voice,
                 "word_timings": tts.word_timings,
+                "intro_sfx": sfx_metadata,
                 "teaser": {
                     "start": round(teaser_start, 3),
                     "end": round(teaser_end, 3),
@@ -152,7 +172,7 @@ def apply_voiceover_hooks(video_name: str):
                     "original_audio_muted_during_hook": True,
                     "audio_ducking": False,
                     "ducking_volume": 0.0,
-                    "mode": "tts_fade_out_then_original_fade_in",
+                    "mode": "tts_plus_intro_sfx_then_original",
                     "fade_duration": VOICEOVER_AUDIO_FADE,
                 },
             }
