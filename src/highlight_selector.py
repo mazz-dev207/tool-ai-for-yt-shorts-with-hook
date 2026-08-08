@@ -9,7 +9,10 @@ from src.config import HIGHLIGHTS_DIR, TEMP_DIR, OLLAMA_MODEL
 from src.logger import info, success
 
 
-MIN_SCORE = 65
+MIN_SCORE = 58
+MIN_DISCOVERY_DURATION = 6.0
+TARGET_MIN_DURATION = 12.0
+MAX_DISCOVERY_DURATION = 60.0
 MAX_BOUNDARY_SNAP_SECONDS = 1.0
 DISCOVERY_NUM_CTX = 4096
 DISCOVERY_NUM_PREDICT = 550
@@ -67,9 +70,35 @@ def _snap(value, boundaries):
     return value
 
 
+def _expand_short_candidate(start, end, window_start, window_end):
+    """Extinde un nucleu scurt fără să iasă din fereastra analizată."""
+    duration = end - start
+    if duration >= TARGET_MIN_DURATION:
+        return start, end
+
+    missing = TARGET_MIN_DURATION - duration
+    before = min(missing / 2.0, start - window_start)
+    after = min(missing - before, window_end - end)
+
+    start -= before
+    end += after
+
+    # Dacă una dintre laturi nu avea suficient spațiu, completăm din cealaltă.
+    remaining = TARGET_MIN_DURATION - (end - start)
+    if remaining > 0:
+        extra_before = min(remaining, start - window_start)
+        start -= extra_before
+        remaining -= extra_before
+    if remaining > 0:
+        extra_after = min(remaining, window_end - end)
+        end += extra_after
+
+    return start, end
+
+
 def _normalize_candidate(result, window):
     if not isinstance(result, dict):
-        return None
+        return None, "candidate_not_object"
 
     window_start = float(window["start"])
     window_end = float(window["end"])
@@ -78,18 +107,29 @@ def _normalize_candidate(result, window):
         start = float(result.get("start"))
         end = float(result.get("end"))
     except (TypeError, ValueError):
-        return None
+        return None, "invalid_timestamps"
 
     start = max(window_start, min(window_end, start))
     end = max(window_start, min(window_end, end))
+
+    raw_duration = end - start
+    if raw_duration < MIN_DISCOVERY_DURATION:
+        return None, f"too_short_core={raw_duration:.1f}s"
+    if raw_duration > MAX_DISCOVERY_DURATION:
+        return None, f"too_long={raw_duration:.1f}s"
+
+    # Discovery trebuie să aibă recall bun. Dacă modelul găsește un moment
+    # concentrat de 6-11s, îi adăugăm context până la ~12s și lăsăm retention
+    # să decidă editarea finală.
+    start, end = _expand_short_candidate(start, end, window_start, window_end)
 
     words = _flatten_words(window)
     start = _snap(start, [item["start"] for item in words])
     end = _snap(end, [item["end"] for item in words])
 
     duration = end - start
-    if duration < 12.0 or duration > 60.0:
-        return None
+    if duration < MIN_DISCOVERY_DURATION or duration > MAX_DISCOVERY_DURATION:
+        return None, f"duration_after_snap={duration:.1f}s"
 
     raw_scores = result.get("scores", {})
     if not isinstance(raw_scores, dict):
@@ -99,7 +139,7 @@ def _normalize_candidate(result, window):
     score = _candidate_score(scores)
 
     if score < MIN_SCORE:
-        return None
+        return None, f"score={score}<{MIN_SCORE}"
 
     return {
         "title": str(result.get("title", "Untitled")).strip() or "Untitled",
@@ -108,7 +148,7 @@ def _normalize_candidate(result, window):
         "start": round(start, 3),
         "end": round(end, 3),
         "duration": round(duration, 3),
-    }
+    }, None
 
 
 def analyze_window(window):
@@ -125,14 +165,16 @@ def analyze_window(window):
 You are a FAST candidate-discovery editor for short-form video.
 A later retention stage will do the detailed edit and generate the voice-over hook.
 
-Find at most ONE strong Short candidate inside this window.
-Choose precise start/end timestamps for the useful story, not automatically the whole window.
-Prioritize immediate interest, curiosity, emotion, story progression, payoff potential, standalone context and information density.
-Reject filler, slow setup, fragmented context and weak/no-payoff moments.
+Find at most ONE promising Short candidate inside this window.
+Discovery should favor RECALL: keep a potentially strong moment even if it still needs trimming or context in the later retention stage.
+Choose the useful story range, not automatically the whole window.
+A candidate core may be as short as 6 seconds if it contains a strong hook, reveal, reaction, emotional beat, useful fact, funny moment, clutch/fail, or payoff.
+Prioritize curiosity, emotion, story progression, payoff potential, standalone context and information density.
+Reject only obvious filler, fragmented context and moments with no meaningful hook/payoff potential.
 Do not invent anything.
 
 Return ONLY valid JSON.
-If there is no strong candidate, return: {{"candidate": null}}
+If there is no promising candidate, return: {{"candidate": null}}
 Otherwise return:
 {{
   "candidate": {{
@@ -163,7 +205,7 @@ TRANSCRIPT:
         think=False,
         keep_alive=OLLAMA_KEEP_ALIVE,
         messages=[
-            {"role": "system", "content": "Return only compact valid JSON. Be conservative."},
+            {"role": "system", "content": "Return only compact valid JSON. Favor recall during discovery; retention will rank quality later."},
             {"role": "user", "content": prompt},
         ],
         format="json",
@@ -186,11 +228,13 @@ TRANSCRIPT:
     try:
         payload = json.loads(response["message"]["content"].strip())
     except json.JSONDecodeError:
-        return None
+        return None, "invalid_json"
 
     raw_candidate = payload.get("candidate") if isinstance(payload, dict) else None
+    if raw_candidate is None:
+        return None, "model_rejected"
     if not isinstance(raw_candidate, dict):
-        return None
+        return None, "candidate_not_object"
 
     return _normalize_candidate(raw_candidate, window)
 
@@ -212,13 +256,16 @@ def select_highlights(video_name):
     info(f"Analizez {len(windows)} ferestre în modul discovery rapid...")
     started = time.time()
     results = []
+    reject_counts = {}
 
     for index, window in enumerate(windows, start=1):
         info(f"Fereastră {index}/{len(windows)}")
         try:
-            result = analyze_window(window)
+            result, rejection = analyze_window(window)
             if result is None:
-                info("Fără candidat suficient de puternic.")
+                reason = rejection or "unknown"
+                reject_counts[reason] = reject_counts.get(reason, 0) + 1
+                info(f"Fără candidat | motiv: {reason}")
                 continue
             info(
                 f"Candidate score: {result['score']} | "
@@ -239,6 +286,10 @@ def select_highlights(video_name):
     output = HIGHLIGHTS_DIR / f"{video_name}.json"
     with open(output, "w", encoding="utf-8") as file:
         json.dump(final, file, indent=2, ensure_ascii=False)
+
+    if reject_counts:
+        summary = ", ".join(f"{key}={value}" for key, value in sorted(reject_counts.items()))
+        info(f"Discovery respingeri: {summary}")
 
     success(f"Au rămas {len(final)} candidați pentru retention optimizer.")
     success(f"Candidate discovery terminat în {time.time() - started:.1f}s.")
