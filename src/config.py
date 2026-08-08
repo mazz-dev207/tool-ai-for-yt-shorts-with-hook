@@ -47,14 +47,15 @@ VIDEO_HEIGHT = 1920
 # Retention Engine
 # --------------------------------------------------
 RETENTION_ENABLED = True
-RETENTION_CONTEXT_BEFORE = 45.0
-RETENTION_CONTEXT_AFTER = 20.0
+RETENTION_CONTEXT_BEFORE = 25.0
+RETENTION_CONTEXT_AFTER = 15.0
 RETENTION_MAX_CANDIDATES = 8
-RETENTION_MAX_VARIANTS = 3
+RETENTION_MAX_VARIANTS = 1
 RETENTION_PREFER_ORIGINAL_HOOK = True
-RETENTION_MAX_SEGMENTS = 8
+RETENTION_MAX_SEGMENTS = 6
 RETENTION_MIN_CLIP_DURATION = 12.0
 RETENTION_MAX_CLIP_DURATION = 60.0
+RETENTION_MIN_FINAL_SCORE = 55
 
 # --------------------------------------------------
 # AI Voice-Over Hooks
@@ -71,7 +72,6 @@ VOICEOVER_MAX_DURATION = 4.0
 # Alternative: "piper" pentru TTS neural local.
 VOICEOVER_TTS_PROVIDER = "kokoro"
 VOICEOVER_VOICE = ""  # gol = vocea implicită a sistemului/modelului
-
 
 # Kokoro-82M (implicit)
 # "auto" folosește CUDA dacă PyTorch o vede, altfel CPU.
@@ -107,3 +107,14 @@ VOICEOVER_PIPER_MODEL_RO = ""
 # Audio în timpul hook-ului.
 VOICEOVER_DUCKING_VOLUME = 0.12
 VOICEOVER_AUDIO_FADE = 0.20
+
+# --------------------------------------------------
+# Intro SFX
+# --------------------------------------------------
+# Pune propriile MP3/WAV/M4A în assets/sfx și descrie efectul în nume:
+# whoosh_fast_reveal.mp3, impact_gaming_clutch.mp3,
+# whoosh_soft_storytelling.mp3, pop_funny.mp3 etc.
+INTRO_SFX_ENABLED = True
+INTRO_SFX_DIR = BASE_DIR / "assets" / "sfx"
+INTRO_SFX_VOLUME = 0.32
+INTRO_SFX_RANDOM_TOP_K = 3
