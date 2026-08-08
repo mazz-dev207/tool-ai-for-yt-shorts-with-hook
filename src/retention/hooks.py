@@ -81,14 +81,18 @@ def _brevity_score(text: str) -> int:
     return max(20, 70 - (count - 14) * 8)
 
 
+def _explicit_metrics(hook: dict) -> dict:
+    if not isinstance(hook, dict):
+        return {}
+    raw = hook.get("metrics") or hook.get("hook_scores") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def _hook_metrics(hook: dict, text: str) -> dict:
     if not isinstance(hook, dict):
         hook = {}
 
-    raw = hook.get("metrics") or hook.get("hook_scores") or {}
-
-    if not isinstance(raw, dict):
-        raw = {}
+    raw = _explicit_metrics(hook)
     metrics = {
         "curiosity": _clamp_score(raw.get("curiosity", hook.get("curiosity", 50))),
         "stakes": _clamp_score(raw.get("stakes", hook.get("stakes", 50))),
@@ -109,7 +113,22 @@ def calculate_hook_score(hook: dict, text: str) -> int:
         hook = {}
 
     metrics = _hook_metrics(hook, text)
-    score = sum(metrics[key] * weight for key, weight in HOOK_WEIGHTS.items())
+    explicit = _explicit_metrics(hook)
+    raw_score = _clamp_score(hook.get("score"))
+
+    if explicit:
+        # Compatibilitate cu formatul vechi/detaliat: când modelul oferă
+        # metricile reale, folosim scorerul multidimensional complet.
+        score = sum(metrics[key] * weight for key, weight in HOOK_WEIGHTS.items())
+        if raw_score:
+            score = score * 0.75 + raw_score * 0.25
+    elif raw_score:
+        # Formatul compact nu mai trimite toate metricile. Nu lăsăm valorile
+        # implicite 50-70 să tragă artificial orice hook spre ~65/100.
+        # Scorul AI domină, iar brevity rămâne verificarea deterministică.
+        score = raw_score * 0.85 + metrics["brevity"] * 0.15
+    else:
+        score = sum(metrics[key] * weight for key, weight in HOOK_WEIGHTS.items())
 
     if str(text or "").lower().startswith(WEAK_PREFIXES):
         score -= 18
@@ -117,10 +136,6 @@ def calculate_hook_score(hook: dict, text: str) -> int:
     evidence = hook.get("evidence") or []
     if bool(hook.get("generated", False)) and not evidence:
         score -= 12
-
-    raw_score = _clamp_score(hook.get("score"))
-    if raw_score:
-        score = score * 0.75 + raw_score * 0.25
 
     return max(0, min(100, int(round(score))))
 
