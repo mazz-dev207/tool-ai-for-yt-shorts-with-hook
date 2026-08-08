@@ -19,6 +19,7 @@ from src.config import (
 from src.logger import info, success, warning
 from src.retention.hooks import select_voiceover_hook
 from src.voiceover.mixer import probe_video, choose_teaser_range, mix_voiceover_hook
+from src.voiceover.sfx import select_intro_sfx
 from src.voiceover.tts import create_tts_provider, fit_audio_to_max_duration
 from src.voiceover.base import approximate_word_timings
 
@@ -117,19 +118,57 @@ def apply_voiceover_hooks(video_name: str):
                 fitted_duration,
             )
 
+            selected_sfx = select_intro_sfx(clip, hook)
+            if selected_sfx:
+                names = " + ".join(item["name"] for item in selected_sfx)
+                info(f"Intro SFX {index}: {names}")
+            else:
+                info(f"Intro SFX {index}: niciun efect potrivit / folder gol")
+
             mixed_path = voice_dir / f"clip_{index}_hooked.mp4"
-            mix_voiceover_hook(
-                video_path=video_path,
-                tts_audio_path=tts.audio_path,
-                output_path=mixed_path,
-                hook_duration=fitted_duration,
-                teaser_start=teaser_start,
-                teaser_end=teaser_end,
-                ducking_volume=VOICEOVER_DUCKING_VOLUME,
-                fade_duration=VOICEOVER_AUDIO_FADE,
-            )
+
+            try:
+                mix_voiceover_hook(
+                    video_path=video_path,
+                    tts_audio_path=tts.audio_path,
+                    output_path=mixed_path,
+                    hook_duration=fitted_duration,
+                    teaser_start=teaser_start,
+                    teaser_end=teaser_end,
+                    ducking_volume=VOICEOVER_DUCKING_VOLUME,
+                    fade_duration=VOICEOVER_AUDIO_FADE,
+                    intro_sfx=selected_sfx,
+                )
+            except Exception as sfx_exc:
+                if not selected_sfx:
+                    raise
+                warning(
+                    f"Intro SFX clip {index} a eșuat ({sfx_exc}); "
+                    "reîncerc hook-ul fără SFX."
+                )
+                selected_sfx = []
+                mix_voiceover_hook(
+                    video_path=video_path,
+                    tts_audio_path=tts.audio_path,
+                    output_path=mixed_path,
+                    hook_duration=fitted_duration,
+                    teaser_start=teaser_start,
+                    teaser_end=teaser_end,
+                    ducking_volume=VOICEOVER_DUCKING_VOLUME,
+                    fade_duration=VOICEOVER_AUDIO_FADE,
+                    intro_sfx=[],
+                )
 
             os.replace(mixed_path, video_path)
+
+            sfx_metadata = [
+                {
+                    "name": item["name"],
+                    "effect": item["effect"],
+                    "categories": item.get("categories", []),
+                }
+                for item in selected_sfx
+            ]
 
             metadata = {
                 "enabled": True,
@@ -142,6 +181,7 @@ def apply_voiceover_hooks(video_name: str):
                 "provider": tts.provider,
                 "voice": tts.voice,
                 "word_timings": tts.word_timings,
+                "intro_sfx": sfx_metadata,
                 "teaser": {
                     "start": round(teaser_start, 3),
                     "end": round(teaser_end, 3),
@@ -152,7 +192,7 @@ def apply_voiceover_hooks(video_name: str):
                     "original_audio_muted_during_hook": True,
                     "audio_ducking": False,
                     "ducking_volume": 0.0,
-                    "mode": "tts_fade_out_then_original_fade_in",
+                    "mode": "tts_with_optional_sfx_then_original_fade_in",
                     "fade_duration": VOICEOVER_AUDIO_FADE,
                 },
             }
@@ -162,7 +202,7 @@ def apply_voiceover_hooks(video_name: str):
             applied += 1
             success(
                 f"Voice-over {index}: {fitted_duration:.2f}s | "
-                f"hook score {metadata['score']}/100"
+                f"hook score {metadata['score']}/100 | SFX={len(sfx_metadata)}"
             )
 
         except Exception as exc:
