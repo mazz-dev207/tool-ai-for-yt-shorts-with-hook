@@ -5,449 +5,144 @@ import time
 
 import ollama
 
-from src.config import (
-    HIGHLIGHTS_DIR,
-    TEMP_DIR,
-    OLLAMA_MODEL
-)
-
-from src.logger import (
-    info,
-    success
-)
+from src.config import HIGHLIGHTS_DIR, TEMP_DIR, OLLAMA_MODEL
+from src.logger import info, success
 
 
-MIN_SCORE = 70
+MIN_SCORE = 62
+
+CANDIDATE_WEIGHTS = {
+    "hook": 0.24,
+    "curiosity": 0.18,
+    "emotion": 0.12,
+    "story": 0.14,
+    "payoff_potential": 0.14,
+    "standalone": 0.10,
+    "information_density": 0.08,
+}
+
+
+def _clamp(value):
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _candidate_score(scores):
+    return round(
+        sum(_clamp(scores.get(key, 0)) * weight for key, weight in CANDIDATE_WEIGHTS.items())
+    )
 
 
 def analyze_window(window):
-
     text = ""
-
     for segment in window["segments"]:
-
         text += (
-            f"[{segment['start']:.1f}s - "
-            f"{segment['end']:.1f}s] "
+            f"[{segment['start']:.1f}s - {segment['end']:.1f}s] "
             f"{segment['text']}\n"
         )
 
-
     prompt = f"""
-You are an expert YouTube Shorts editor.
+You are a candidate-discovery editor for YouTube Shorts, TikTok and Reels.
+This is only a ROUGH discovery pass. A later retention optimizer will do the detailed edit.
 
-Analyze this transcript and decide how viral this moment could be.
+Evaluate the window independently. Do not default to the same score for every window.
+Return ONLY valid JSON with:
+- title: short factual title
+- scores: integer 0-100 fields: hook, curiosity, emotion, story, payoff_potential, standalone, information_density
+- reason: one short sentence explaining why this window is or is not promising
 
-Evaluate:
+Scoring guidance:
+0-39 weak, 40-59 mediocre, 60-74 usable, 75-89 strong, 90-100 exceptional.
+Be conservative. Do not invent facts.
 
-- strong hook
-- curiosity
-- emotional impact
-- storytelling
-- educational value
-- audience retention potential
-
-Return ONLY valid JSON.
-
-Format:
-
-{{
-    "title": "short title",
-    "score": 85
-}}
-
-Score:
-0 = boring
-100 = extremely engaging
-
-Transcript:
-
-{text}
-"""
-
+Transcript:\n{text}
+""".strip()
 
     start_time = time.time()
-
-
     response = ollama.chat(
-
         model=OLLAMA_MODEL,
-
         stream=False,
-
         messages=[
-
-            {
-                "role": "system",
-                "content":
-                "Return only valid JSON. No explanations."
-            },
-
-            {
-                "role": "user",
-                "content": prompt
-            }
-
+            {"role": "system", "content": "Return only valid JSON. Score each dimension independently."},
+            {"role": "user", "content": prompt},
         ],
-
         format="json",
-
-        options={
-
-            "temperature": 0.2,
-
-            "think": False
-
-        }
-
+        options={"temperature": 0.15, "think": False},
     )
 
-
-    elapsed = (
-        time.time()
-        -
-        start_time
-    )
-
-
-    info(
-        f"Ollama răspuns în {elapsed:.2f}s"
-    )
-
-
-    content = (
-        response["message"]["content"]
-        .strip()
-    )
-
+    info(f"Ollama răspuns în {time.time() - start_time:.2f}s")
 
     try:
-
-        result = json.loads(
-            content
-        )
-
+        result = json.loads(response["message"]["content"].strip())
     except json.JSONDecodeError:
+        result = {"title": "Untitled", "scores": {}, "reason": "invalid_json"}
 
-        info(
-            "Răspuns JSON invalid. Se ignoră."
-        )
-
-        result = {
-
-            "title":
-            "Untitled",
-
-            "score":
-            0
-
-        }
-
-
-    if "title" not in result:
-
-        result["title"] = (
-            "Untitled"
-        )
-
-
-    if "score" not in result:
-
-        result["score"] = 0
-
-
-    result["start"] = (
-        window["start"]
-    )
-
-    result["end"] = (
-        window["end"]
-    )
-
-
+    scores = result.get("scores", {}) if isinstance(result, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    result["title"] = str(result.get("title", "Untitled"))
+    result["scores"] = {key: _clamp(scores.get(key, 0)) for key in CANDIDATE_WEIGHTS}
+    result["score"] = _candidate_score(result["scores"])
+    result["start"] = float(window["start"])
+    result["end"] = float(window["end"])
     return result
-def overlap(a, b):
 
-    return (
 
-        a["start"] < b["end"]
-
-        and
-
-        a["end"] > b["start"]
-
-    )
-
+def overlap_ratio(a, b):
+    intersection = max(0.0, min(a["end"], b["end"]) - max(a["start"], b["start"]))
+    shorter = max(0.001, min(a["end"] - a["start"], b["end"] - b["start"]))
+    return intersection / shorter
 
 
 def select_highlights(video_name):
-
-
-    chunk_file = (
-
-        TEMP_DIR
-
-        /
-
-        f"{video_name}_chunks.json"
-
-    )
-
-
+    chunk_file = TEMP_DIR / f"{video_name}_chunks.json"
     if not chunk_file.exists():
+        raise FileNotFoundError(chunk_file)
 
-        raise FileNotFoundError(
+    with open(chunk_file, encoding="utf-8") as file:
+        windows = json.load(file)
 
-            chunk_file
-
-        )
-
-
-    with open(
-
-        chunk_file,
-
-        encoding="utf-8"
-
-    ) as f:
-
-        windows = json.load(f)
-
-
-
-    info(
-
-        f"Analizez {len(windows)} ferestre..."
-
-    )
-
-
+    info(f"Analizez {len(windows)} ferestre pentru candidați...")
     results = []
 
-
-    for index, window in enumerate(
-
-        windows,
-
-        start=1
-
-    ):
-
-        info(
-
-            f"Fereastră {index}/{len(windows)}"
-
-        )
-
-
+    for index, window in enumerate(windows, start=1):
+        info(f"Fereastră {index}/{len(windows)}")
         try:
-
-
-            result = analyze_window(
-
-                window
-
-            )
-
-
-            info(
-
-                f"Score: {result['score']} | "
-
-                f"{result['title']}"
-
-            )
-
-
+            result = analyze_window(window)
+            info(f"Candidate score: {result['score']} | {result['title']}")
             if result["score"] >= MIN_SCORE:
+                results.append(result)
+        except Exception as exc:
+            info(f"Eroare la fereastra {index}: {exc}")
 
-
-                results.append(
-
-                    result
-
-                )
-
-
-        except Exception as e:
-
-
-            info(
-
-                f"Eroare la fereastra {index}: {e}"
-
-            )
-
-
-
-    if not results:
-
-
-        info(
-
-            "Niciun highlight nu a trecut scorul minim."
-
-        )
-
-
-
-    results.sort(
-
-        key=lambda x: x["score"],
-
-        reverse=True
-
-    )
-
-
+    results.sort(key=lambda item: item["score"], reverse=True)
 
     final = []
-
-
-
     for clip in results:
+        # Ferestrele vecine au overlap intenționat. Eliminăm doar candidații
+        # aproape duplicat, nu orice intersecție de 15 secunde.
+        if not any(overlap_ratio(clip, selected) >= 0.72 for selected in final):
+            final.append(clip)
 
+    HIGHLIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    output = HIGHLIGHTS_DIR / f"{video_name}.json"
 
-        duplicated = False
+    with open(output, "w", encoding="utf-8") as file:
+        json.dump(final, file, indent=2, ensure_ascii=False)
 
-
-        for selected in final:
-
-
-            if overlap(
-
-                clip,
-
-                selected
-
-            ):
-
-
-                duplicated = True
-
-                break
-
-
-
-        if not duplicated:
-
-
-            final.append(
-
-                clip
-
-            )
-
-
-
-    HIGHLIGHTS_DIR.mkdir(
-
-        parents=True,
-
-        exist_ok=True
-
-    )
-
-
-    output = (
-
-        HIGHLIGHTS_DIR
-
-        /
-
-        f"{video_name}.json"
-
-    )
-
-
-
-    with open(
-
-        output,
-
-        "w",
-
-        encoding="utf-8"
-
-    ) as f:
-
-
-        json.dump(
-
-            final,
-
-            f,
-
-            indent=4,
-
-            ensure_ascii=False
-
-        )
-
-
-
-    success(
-
-        f"Au rămas {len(final)} clipuri."
-
-    )
-
-
-    success(
-
-        f"Highlights salvate: {output}"
-
-    )
-
-
+    success(f"Au rămas {len(final)} candidați pentru retention optimizer.")
+    success(f"Candidați salvați: {output}")
     return output
 
 
-
-
-
 if __name__ == "__main__":
-
-
     if len(sys.argv) < 2:
-
-
-        print(
-
-            'Utilizare: python src/highlight_selector.py "video_name"'
-
-        )
-
+        print('Utilizare: python src/highlight_selector.py "video_name"')
         sys.exit(1)
 
-
-
     try:
-
-
-        video_name = " ".join(
-
-            sys.argv[1:]
-
-        )
-
-
-        select_highlights(
-
-            video_name
-
-        )
-
-
-    except Exception as e:
-
-
-        print()
-
-        print(
-
-            f"Eroare: {e}"
-
-        )
-
+        select_highlights(" ".join(sys.argv[1:]))
+    except Exception as exc:
+        print(f"Eroare: {exc}")
         sys.exit(1)
