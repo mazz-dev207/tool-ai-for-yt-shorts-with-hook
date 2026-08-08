@@ -9,7 +9,11 @@ from src.config import HIGHLIGHTS_DIR, TEMP_DIR, OLLAMA_MODEL
 from src.logger import info, success
 
 
-MIN_SCORE = 62
+MIN_SCORE = 65
+MAX_BOUNDARY_SNAP_SECONDS = 1.0
+DISCOVERY_NUM_CTX = 4096
+DISCOVERY_NUM_PREDICT = 550
+OLLAMA_KEEP_ALIVE = "30m"
 
 CANDIDATE_WEIGHTS = {
     "hook": 0.24,
@@ -35,58 +39,160 @@ def _candidate_score(scores):
     )
 
 
+def _flatten_words(window):
+    words = []
+    window_start = float(window["start"])
+    window_end = float(window["end"])
+
+    for segment in window.get("segments", []):
+        for word in segment.get("words", []):
+            try:
+                start = float(word["start"])
+                end = float(word["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end < window_start or start > window_end:
+                continue
+            words.append({"start": start, "end": end})
+
+    return words
+
+
+def _snap(value, boundaries):
+    if not boundaries:
+        return value
+    nearest = min(boundaries, key=lambda item: abs(item - value))
+    if abs(nearest - value) <= MAX_BOUNDARY_SNAP_SECONDS:
+        return nearest
+    return value
+
+
+def _normalize_candidate(result, window):
+    if not isinstance(result, dict):
+        return None
+
+    window_start = float(window["start"])
+    window_end = float(window["end"])
+
+    try:
+        start = float(result.get("start"))
+        end = float(result.get("end"))
+    except (TypeError, ValueError):
+        return None
+
+    start = max(window_start, min(window_end, start))
+    end = max(window_start, min(window_end, end))
+
+    words = _flatten_words(window)
+    start = _snap(start, [item["start"] for item in words])
+    end = _snap(end, [item["end"] for item in words])
+
+    duration = end - start
+    if duration < 12.0 or duration > 60.0:
+        return None
+
+    raw_scores = result.get("scores", {})
+    if not isinstance(raw_scores, dict):
+        raw_scores = {}
+
+    scores = {key: _clamp(raw_scores.get(key, 0)) for key in CANDIDATE_WEIGHTS}
+    score = _candidate_score(scores)
+
+    if score < MIN_SCORE:
+        return None
+
+    return {
+        "title": str(result.get("title", "Untitled")).strip() or "Untitled",
+        "scores": scores,
+        "score": score,
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "duration": round(duration, 3),
+    }
+
+
 def analyze_window(window):
-    text = ""
-    for segment in window["segments"]:
-        text += (
-            f"[{segment['start']:.1f}s - {segment['end']:.1f}s] "
-            f"{segment['text']}\n"
+    transcript_lines = []
+    for segment in window.get("segments", []):
+        text = str(segment.get("text", "")).strip()
+        if not text:
+            continue
+        transcript_lines.append(
+            f"[{float(segment['start']):.2f}s-{float(segment['end']):.2f}s] {text}"
         )
 
     prompt = f"""
-You are a candidate-discovery editor for YouTube Shorts, TikTok and Reels.
-This is only a ROUGH discovery pass. A later retention optimizer will do the detailed edit.
+You are a FAST candidate-discovery editor for short-form video.
+A later retention stage will do the detailed edit and generate the voice-over hook.
 
-Evaluate the window independently. Do not default to the same score for every window.
-Return ONLY valid JSON with:
-- title: short factual title
-- scores: integer 0-100 fields: hook, curiosity, emotion, story, payoff_potential, standalone, information_density
-- reason: one short sentence explaining why this window is or is not promising
+Find at most ONE strong Short candidate inside this window.
+Choose precise start/end timestamps for the useful story, not automatically the whole window.
+Prioritize immediate interest, curiosity, emotion, story progression, payoff potential, standalone context and information density.
+Reject filler, slow setup, fragmented context and weak/no-payoff moments.
+Do not invent anything.
 
-Scoring guidance:
-0-39 weak, 40-59 mediocre, 60-74 usable, 75-89 strong, 90-100 exceptional.
-Be conservative. Do not invent facts.
+Return ONLY valid JSON.
+If there is no strong candidate, return: {{"candidate": null}}
+Otherwise return:
+{{
+  "candidate": {{
+    "start": 0.0,
+    "end": 0.0,
+    "title": "short factual title",
+    "scores": {{
+      "hook": 0,
+      "curiosity": 0,
+      "emotion": 0,
+      "story": 0,
+      "payoff_potential": 0,
+      "standalone": 0,
+      "information_density": 0
+    }}
+  }}
+}}
 
-Transcript:\n{text}
+WINDOW: {float(window['start']):.2f}s -> {float(window['end']):.2f}s
+TRANSCRIPT:
+{chr(10).join(transcript_lines)}
 """.strip()
 
     start_time = time.time()
     response = ollama.chat(
         model=OLLAMA_MODEL,
         stream=False,
+        think=False,
+        keep_alive=OLLAMA_KEEP_ALIVE,
         messages=[
-            {"role": "system", "content": "Return only valid JSON. Score each dimension independently."},
+            {"role": "system", "content": "Return only compact valid JSON. Be conservative."},
             {"role": "user", "content": prompt},
         ],
         format="json",
-        options={"temperature": 0.15, "think": False},
+        options={
+            "temperature": 0.10,
+            "num_ctx": DISCOVERY_NUM_CTX,
+            "num_predict": DISCOVERY_NUM_PREDICT,
+        },
     )
 
-    info(f"Ollama răspuns în {time.time() - start_time:.2f}s")
+    elapsed = time.time() - start_time
+    load_ms = float(response.get("load_duration", 0) or 0) / 1_000_000
+    prompt_tokens = int(response.get("prompt_eval_count", 0) or 0)
+    output_tokens = int(response.get("eval_count", 0) or 0)
+    info(
+        f"Ollama răspuns în {elapsed:.2f}s | load={load_ms:.0f}ms | "
+        f"in={prompt_tokens} tok | out={output_tokens} tok"
+    )
 
     try:
-        result = json.loads(response["message"]["content"].strip())
+        payload = json.loads(response["message"]["content"].strip())
     except json.JSONDecodeError:
-        result = {"title": "Untitled", "scores": {}, "reason": "invalid_json"}
+        return None
 
-    scores = result.get("scores", {}) if isinstance(result, dict) else {}
-    result = result if isinstance(result, dict) else {}
-    result["title"] = str(result.get("title", "Untitled"))
-    result["scores"] = {key: _clamp(scores.get(key, 0)) for key in CANDIDATE_WEIGHTS}
-    result["score"] = _candidate_score(result["scores"])
-    result["start"] = float(window["start"])
-    result["end"] = float(window["end"])
-    return result
+    raw_candidate = payload.get("candidate") if isinstance(payload, dict) else None
+    if not isinstance(raw_candidate, dict):
+        return None
+
+    return _normalize_candidate(raw_candidate, window)
 
 
 def overlap_ratio(a, b):
@@ -103,16 +209,22 @@ def select_highlights(video_name):
     with open(chunk_file, encoding="utf-8") as file:
         windows = json.load(file)
 
-    info(f"Analizez {len(windows)} ferestre pentru candidați...")
+    info(f"Analizez {len(windows)} ferestre în modul discovery rapid...")
+    started = time.time()
     results = []
 
     for index, window in enumerate(windows, start=1):
         info(f"Fereastră {index}/{len(windows)}")
         try:
             result = analyze_window(window)
-            info(f"Candidate score: {result['score']} | {result['title']}")
-            if result["score"] >= MIN_SCORE:
-                results.append(result)
+            if result is None:
+                info("Fără candidat suficient de puternic.")
+                continue
+            info(
+                f"Candidate score: {result['score']} | "
+                f"{result['start']:.2f}s-{result['end']:.2f}s | {result['title']}"
+            )
+            results.append(result)
         except Exception as exc:
             info(f"Eroare la fereastra {index}: {exc}")
 
@@ -120,18 +232,16 @@ def select_highlights(video_name):
 
     final = []
     for clip in results:
-        # Ferestrele vecine au overlap intenționat. Eliminăm doar candidații
-        # aproape duplicat, nu orice intersecție de 15 secunde.
-        if not any(overlap_ratio(clip, selected) >= 0.72 for selected in final):
+        if not any(overlap_ratio(clip, selected) >= 0.60 for selected in final):
             final.append(clip)
 
     HIGHLIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     output = HIGHLIGHTS_DIR / f"{video_name}.json"
-
     with open(output, "w", encoding="utf-8") as file:
         json.dump(final, file, indent=2, ensure_ascii=False)
 
     success(f"Au rămas {len(final)} candidați pentru retention optimizer.")
+    success(f"Candidate discovery terminat în {time.time() - started:.1f}s.")
     success(f"Candidați salvați: {output}")
     return output
 
