@@ -10,9 +10,10 @@ from src.logger import info, success
 
 
 MIN_SCORE = 58
-MIN_DISCOVERY_DURATION = 6.0
+MIN_DISCOVERY_DURATION = 2.0
 TARGET_MIN_DURATION = 12.0
 MAX_DISCOVERY_DURATION = 60.0
+MIN_FALLBACK_CANDIDATES = 5
 MAX_BOUNDARY_SNAP_SECONDS = 1.0
 DISCOVERY_NUM_CTX = 4096
 DISCOVERY_NUM_PREDICT = 550
@@ -34,6 +35,32 @@ def _clamp(value):
         return max(0, min(100, int(round(float(value)))))
     except (TypeError, ValueError):
         return 0
+
+
+def _normalize_score_scale(raw_scores):
+    """Acceptă atât scoruri 0-100, cât și răspunsuri accidentale 0-10."""
+    if not isinstance(raw_scores, dict):
+        return {key: 0 for key in CANDIDATE_WEIGHTS}, "invalid"
+
+    parsed = {}
+    numeric_values = []
+    for key in CANDIDATE_WEIGHTS:
+        try:
+            value = float(raw_scores.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        parsed[key] = value
+        if value > 0:
+            numeric_values.append(value)
+
+    # Dacă toate scorurile nenule sunt <=10, modelul a folosit scala 0-10.
+    scale = 10.0 if numeric_values and max(numeric_values) <= 10.0 else 1.0
+    label = "0-10_rescaled" if scale == 10.0 else "0-100"
+
+    return {
+        key: _clamp(value * scale)
+        for key, value in parsed.items()
+    }, label
 
 
 def _candidate_score(scores):
@@ -83,7 +110,6 @@ def _expand_short_candidate(start, end, window_start, window_end):
     start -= before
     end += after
 
-    # Dacă una dintre laturi nu avea suficient spațiu, completăm din cealaltă.
     remaining = TARGET_MIN_DURATION - (end - start)
     if remaining > 0:
         extra_before = min(remaining, start - window_start)
@@ -100,6 +126,10 @@ def _normalize_candidate(result, window):
     if not isinstance(result, dict):
         return None, "candidate_not_object"
 
+    raw_scores = result.get("scores", {})
+    scores, score_scale = _normalize_score_scale(raw_scores)
+    score = _candidate_score(scores)
+
     window_start = float(window["start"])
     window_end = float(window["end"])
 
@@ -114,13 +144,20 @@ def _normalize_candidate(result, window):
 
     raw_duration = end - start
     if raw_duration < MIN_DISCOVERY_DURATION:
-        return None, f"too_short_core={raw_duration:.1f}s"
+        return None, f"too_short_core={raw_duration:.1f}s", {
+            "score": score,
+            "score_scale": score_scale,
+            "raw_duration": raw_duration,
+        }
     if raw_duration > MAX_DISCOVERY_DURATION:
-        return None, f"too_long={raw_duration:.1f}s"
+        return None, f"too_long={raw_duration:.1f}s", {
+            "score": score,
+            "score_scale": score_scale,
+            "raw_duration": raw_duration,
+        }
 
-    # Discovery trebuie să aibă recall bun. Dacă modelul găsește un moment
-    # concentrat de 6-11s, îi adăugăm context până la ~12s și lăsăm retention
-    # să decidă editarea finală.
+    # Discovery găsește nucleul momentului. Îi adăugăm context până la ~12s,
+    # iar retention decide ulterior tăierea finală.
     start, end = _expand_short_candidate(start, end, window_start, window_end)
 
     words = _flatten_words(window)
@@ -129,26 +166,31 @@ def _normalize_candidate(result, window):
 
     duration = end - start
     if duration < MIN_DISCOVERY_DURATION or duration > MAX_DISCOVERY_DURATION:
-        return None, f"duration_after_snap={duration:.1f}s"
+        return None, f"duration_after_snap={duration:.1f}s", {
+            "score": score,
+            "score_scale": score_scale,
+            "raw_duration": raw_duration,
+        }
 
-    raw_scores = result.get("scores", {})
-    if not isinstance(raw_scores, dict):
-        raw_scores = {}
-
-    scores = {key: _clamp(raw_scores.get(key, 0)) for key in CANDIDATE_WEIGHTS}
-    score = _candidate_score(scores)
-
-    if score < MIN_SCORE:
-        return None, f"score={score}<{MIN_SCORE}"
-
-    return {
+    candidate = {
         "title": str(result.get("title", "Untitled")).strip() or "Untitled",
         "scores": scores,
         "score": score,
+        "score_scale": score_scale,
         "start": round(start, 3),
         "end": round(end, 3),
         "duration": round(duration, 3),
-    }, None
+        "discovery_core_duration": round(raw_duration, 3),
+    }
+
+    if score < MIN_SCORE:
+        return candidate, f"score={score}<{MIN_SCORE}", {
+            "score": score,
+            "score_scale": score_scale,
+            "raw_duration": raw_duration,
+        }
+
+    return candidate, None, None
 
 
 def analyze_window(window):
@@ -168,10 +210,14 @@ A later retention stage will do the detailed edit and generate the voice-over ho
 Find at most ONE promising Short candidate inside this window.
 Discovery should favor RECALL: keep a potentially strong moment even if it still needs trimming or context in the later retention stage.
 Choose the useful story range, not automatically the whole window.
-A candidate core may be as short as 6 seconds if it contains a strong hook, reveal, reaction, emotional beat, useful fact, funny moment, clutch/fail, or payoff.
+The selected core should normally be at least 2 seconds and may be short if it contains a strong hook, reveal, reaction, emotional beat, useful fact, funny moment, clutch/fail, or payoff.
 Prioritize curiosity, emotion, story progression, payoff potential, standalone context and information density.
 Reject only obvious filler, fragmented context and moments with no meaningful hook/payoff potential.
 Do not invent anything.
+
+IMPORTANT SCORING RULE:
+Every score MUST be an integer from 0 to 100, where 0 is extremely weak and 100 is exceptional.
+Do NOT use a 0-10 scale.
 
 Return ONLY valid JSON.
 If there is no promising candidate, return: {{"candidate": null}}
@@ -205,7 +251,13 @@ TRANSCRIPT:
         think=False,
         keep_alive=OLLAMA_KEEP_ALIVE,
         messages=[
-            {"role": "system", "content": "Return only compact valid JSON. Favor recall during discovery; retention will rank quality later."},
+            {
+                "role": "system",
+                "content": (
+                    "Return only compact valid JSON. Favor recall during discovery; "
+                    "retention will rank quality later. Scores must be 0-100 integers."
+                ),
+            },
             {"role": "user", "content": prompt},
         ],
         format="json",
@@ -228,21 +280,33 @@ TRANSCRIPT:
     try:
         payload = json.loads(response["message"]["content"].strip())
     except json.JSONDecodeError:
-        return None, "invalid_json"
+        return None, "invalid_json", None
 
     raw_candidate = payload.get("candidate") if isinstance(payload, dict) else None
     if raw_candidate is None:
-        return None, "model_rejected"
+        return None, "model_rejected", None
     if not isinstance(raw_candidate, dict):
-        return None, "candidate_not_object"
+        return None, "candidate_not_object", None
 
-    return _normalize_candidate(raw_candidate, window)
+    normalized = _normalize_candidate(raw_candidate, window)
+    if len(normalized) == 2:
+        candidate, rejection = normalized
+        return candidate, rejection, None
+    return normalized
 
 
 def overlap_ratio(a, b):
     intersection = max(0.0, min(a["end"], b["end"]) - max(a["start"], b["start"]))
     shorter = max(0.001, min(a["end"] - a["start"], b["end"] - b["start"]))
     return intersection / shorter
+
+
+def _dedupe_ranked(candidates):
+    final = []
+    for clip in sorted(candidates, key=lambda item: item["score"], reverse=True):
+        if not any(overlap_ratio(clip, selected) >= 0.60 for selected in final):
+            final.append(clip)
+    return final
 
 
 def select_highlights(video_name):
@@ -255,32 +319,66 @@ def select_highlights(video_name):
 
     info(f"Analizez {len(windows)} ferestre în modul discovery rapid...")
     started = time.time()
-    results = []
+    accepted = []
+    fallback_pool = []
     reject_counts = {}
 
     for index, window in enumerate(windows, start=1):
         info(f"Fereastră {index}/{len(windows)}")
         try:
-            result, rejection = analyze_window(window)
-            if result is None:
-                reason = rejection or "unknown"
-                reject_counts[reason] = reject_counts.get(reason, 0) + 1
-                info(f"Fără candidat | motiv: {reason}")
+            result, rejection, diagnostic = analyze_window(window)
+
+            # Un candidat valid ca timp dar sub prag rămâne disponibil pentru
+            # fallback, ca discovery să nu poată produce accidental zero rezultate.
+            if result is not None and rejection and rejection.startswith("score="):
+                fallback_pool.append(result)
+
+            if rejection:
+                reject_counts[rejection] = reject_counts.get(rejection, 0) + 1
+                extra = ""
+                if diagnostic:
+                    extra = (
+                        f" | score={diagnostic.get('score', 0)} "
+                        f"scale={diagnostic.get('score_scale', '?')}"
+                    )
+                info(f"Fără candidat | motiv: {rejection}{extra}")
                 continue
+
+            if result is None:
+                reject_counts["unknown"] = reject_counts.get("unknown", 0) + 1
+                info("Fără candidat | motiv: unknown")
+                continue
+
             info(
-                f"Candidate score: {result['score']} | "
+                f"Candidate score: {result['score']} | scale={result['score_scale']} | "
+                f"core={result['discovery_core_duration']:.1f}s | "
                 f"{result['start']:.2f}s-{result['end']:.2f}s | {result['title']}"
             )
-            results.append(result)
+            accepted.append(result)
         except Exception as exc:
             info(f"Eroare la fereastra {index}: {exc}")
 
-    results.sort(key=lambda item: item["score"], reverse=True)
+    final = _dedupe_ranked(accepted)
 
-    final = []
-    for clip in results:
-        if not any(overlap_ratio(clip, selected) >= 0.60 for selected in final):
+    if len(final) < MIN_FALLBACK_CANDIDATES and fallback_pool:
+        fallback_ranked = _dedupe_ranked(fallback_pool)
+        needed = MIN_FALLBACK_CANDIDATES - len(final)
+        added = 0
+        for clip in fallback_ranked:
+            if added >= needed:
+                break
+            if any(overlap_ratio(clip, selected) >= 0.60 for selected in final):
+                continue
             final.append(clip)
+            added += 1
+
+        if added:
+            info(
+                f"Discovery fallback: am recuperat {added} candidați sub prag "
+                f"pentru a păstra recall-ul."
+            )
+
+    final.sort(key=lambda item: item["score"], reverse=True)
 
     HIGHLIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     output = HIGHLIGHTS_DIR / f"{video_name}.json"
