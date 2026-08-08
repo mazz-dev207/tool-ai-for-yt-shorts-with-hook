@@ -73,21 +73,23 @@ def classify_context(clip: dict, hook: dict) -> set[str]:
     return categories
 
 
-def desired_effects(categories: set[str]) -> List[str]:
+def desired_effect(categories: set[str]) -> str:
+    """Returnează o singură familie de efect pentru fiecare hook."""
     # Emotional content intentionally avoids aggressive intro effects.
     if "emotional" in categories and not ({"surprise", "gaming"} & categories):
-        return ["whoosh_soft"]
+        return "whoosh_soft"
 
+    # Reveal/surprise poate folosi fie whoosh, fie impact, dar niciodată ambele.
     if "surprise" in categories:
-        return ["whoosh", "impact"]
+        return "whoosh_or_impact"
     if "gaming" in categories:
-        return ["impact"]
+        return "impact"
     if "funny" in categories:
-        return ["pop_or_whoosh"]
+        return "pop_or_whoosh"
     if "storytelling" in categories:
-        return ["whoosh_soft"]
+        return "whoosh_soft"
 
-    return ["whoosh"]
+    return "whoosh"
 
 
 def _effect_matches(file_tags: set[str], effect: str) -> bool:
@@ -95,7 +97,21 @@ def _effect_matches(file_tags: set[str], effect: str) -> bool:
         return bool(file_tags & EFFECT_TAGS["whoosh"]) and bool(file_tags & SOFT_TAGS)
     if effect == "pop_or_whoosh":
         return bool(file_tags & (EFFECT_TAGS["pop"] | EFFECT_TAGS["whoosh"]))
+    if effect == "whoosh_or_impact":
+        return bool(file_tags & (EFFECT_TAGS["whoosh"] | EFFECT_TAGS["impact"]))
     return bool(file_tags & EFFECT_TAGS.get(effect, {effect}))
+
+
+def _actual_effect(path: Path) -> str:
+    """Păstrează tipul real al fișierului pentru mixaj/delay."""
+    tags = _file_tags(path)
+    if tags & EFFECT_TAGS["impact"]:
+        return "impact"
+    if tags & EFFECT_TAGS["pop"]:
+        return "pop"
+    if tags & EFFECT_TAGS["whoosh"]:
+        return "whoosh"
+    return "sfx"
 
 
 def _score_file(path: Path, categories: set[str], effect: str) -> int:
@@ -135,11 +151,9 @@ def _available_files() -> List[Path]:
     )
 
 
-def _choose_for_effect(files: List[Path], categories: set[str], effect: str, used: set[Path]):
+def _choose_for_effect(files: List[Path], categories: set[str], effect: str):
     ranked = []
     for path in files:
-        if path in used:
-            continue
         score = _score_file(path, categories, effect)
         if score > -999:
             ranked.append((score, path))
@@ -150,7 +164,7 @@ def _choose_for_effect(files: List[Path], categories: set[str], effect: str, use
     ranked.sort(key=lambda item: (-item[0], item[1].name.lower()))
     best_score = ranked[0][0]
 
-    # Random only among strong matches close to the best score.
+    # Random doar între potrivirile foarte apropiate de cel mai bun scor.
     shortlist = [
         path
         for score, path in ranked
@@ -161,33 +175,28 @@ def _choose_for_effect(files: List[Path], categories: set[str], effect: str, use
 
 
 def select_intro_sfx(clip: dict, hook: dict) -> List[dict]:
+    """Selectează MAXIMUM UN SFX pentru hook. Fișierul este redat o singură dată."""
     files = _available_files()
     if not files:
         return []
 
     categories = classify_context(clip, hook)
-    effects = desired_effects(categories)
+    requested_effect = desired_effect(categories)
 
-    selected = []
-    used = set()
+    path = _choose_for_effect(files, categories, requested_effect)
 
-    for effect in effects:
-        path = _choose_for_effect(files, categories, effect, used)
+    # Pentru storytelling/emotional, dacă nu există un *_soft_* potrivit,
+    # folosim un whoosh normal în loc să alegem un efect agresiv.
+    if path is None and requested_effect == "whoosh_soft":
+        path = _choose_for_effect(files, categories, "whoosh")
 
-        # For a soft storytelling/emotional whoosh, fall back to any whoosh
-        # rather than disabling SFX completely when no *_soft_* file exists.
-        if path is None and effect == "whoosh_soft":
-            path = _choose_for_effect(files, categories, "whoosh", used)
+    if path is None:
+        return []
 
-        if path is None:
-            continue
-
-        used.add(path)
-        selected.append({
-            "path": path,
-            "name": path.name,
-            "effect": effect,
-            "categories": sorted(categories),
-        })
-
-    return selected
+    return [{
+        "path": path,
+        "name": path.name,
+        "effect": _actual_effect(path),
+        "requested_effect": requested_effect,
+        "categories": sorted(categories),
+    }]
