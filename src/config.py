@@ -71,21 +71,15 @@ VOICEOVER_MAX_DURATION = 4.0
 # Provider implicit fără dependențe Python suplimentare pe Windows.
 # Alternative: "piper" pentru TTS neural local.
 VOICEOVER_TTS_PROVIDER = "kokoro"
-VOICEOVER_VOICE = ""  # gol = vocea implicită a sistemului/modelului
+VOICEOVER_VOICE = ""
 
-
-# Kokoro-82M (implicit)
-# "auto" folosește CUDA dacă PyTorch o vede, altfel CPU.
+# Kokoro-82M
 VOICEOVER_KOKORO_REPO_ID = "hexgrad/Kokoro-82M"
 VOICEOVER_KOKORO_DEVICE = "auto"
 VOICEOVER_KOKORO_SPEED = 1.10
 VOICEOVER_KOKORO_DEFAULT_LANGUAGE = "en"
-
-# Kokoro nu are momentan suport oficial pentru română.
-# Pentru hook-uri RO folosim automat SAPI ca fallback.
 VOICEOVER_KOKORO_FALLBACK_PROVIDER = "windows_sapi"
 
-# Voci implicite per limbă. Poți schimba doar EN dacă majoritatea clipurilor sunt englezești.
 VOICEOVER_KOKORO_VOICE_EN = "af_heart"
 VOICEOVER_KOKORO_VOICE_EN_GB = "bf_emma"
 VOICEOVER_KOKORO_VOICE_ES = "ef_dora"
@@ -97,10 +91,10 @@ VOICEOVER_KOKORO_VOICE_JA = "jf_alpha"
 VOICEOVER_KOKORO_VOICE_ZH = "zf_xiaobei"
 
 # Windows SAPI
-VOICEOVER_SAPI_RATE = 1       # -10 .. 10
-VOICEOVER_SAPI_VOLUME = 100   # 0 .. 100
+VOICEOVER_SAPI_RATE = 1
+VOICEOVER_SAPI_VOLUME = 100
 
-# Piper (opțional): setează căile către modelele .onnx dacă alegi provider="piper".
+# Piper
 VOICEOVER_PIPER_EXECUTABLE = "piper"
 VOICEOVER_PIPER_MODEL_EN = ""
 VOICEOVER_PIPER_MODEL_RO = ""
@@ -108,3 +102,16 @@ VOICEOVER_PIPER_MODEL_RO = ""
 # Audio în timpul hook-ului.
 VOICEOVER_DUCKING_VOLUME = 0.12
 VOICEOVER_AUDIO_FADE = 0.20
+
+# --------------------------------------------------
+# Smart Intro SFX
+# --------------------------------------------------
+# Pune propriile fișiere în assets/sfx. Numele fișierului este metadata:
+# whoosh_fast_reveal.mp3, impact_gaming_clutch.mp3,
+# whoosh_soft_storytelling.mp3, pop_funny_comedy.mp3 etc.
+INTRO_SFX_ENABLED = True
+INTRO_SFX_DIR = BASE_DIR / "assets" / "sfx"
+INTRO_SFX_VOLUME = 0.30
+INTRO_SFX_RANDOM_TOP_K = 3
+INTRO_SFX_IMPACT_DELAY_MS = 120
+INTRO_SFX_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
