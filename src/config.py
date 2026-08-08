@@ -73,7 +73,6 @@ VOICEOVER_MAX_DURATION = 4.0
 VOICEOVER_TTS_PROVIDER = "kokoro"
 VOICEOVER_VOICE = ""  # gol = vocea implicită a sistemului/modelului
 
-
 # Kokoro-82M (implicit)
 # "auto" folosește CUDA dacă PyTorch o vede, altfel CPU.
 VOICEOVER_KOKORO_REPO_ID = "hexgrad/Kokoro-82M"
@@ -108,3 +107,14 @@ VOICEOVER_PIPER_MODEL_RO = ""
 # Audio în timpul hook-ului.
 VOICEOVER_DUCKING_VOLUME = 0.12
 VOICEOVER_AUDIO_FADE = 0.20
+
+# --------------------------------------------------
+# Intro SFX
+# --------------------------------------------------
+# Pune propriile MP3/WAV/M4A în assets/sfx și descrie efectul în nume:
+# whoosh_fast_reveal.mp3, impact_gaming_clutch.mp3,
+# whoosh_soft_storytelling.mp3, pop_funny.mp3 etc.
+INTRO_SFX_ENABLED = True
+INTRO_SFX_DIR = BASE_DIR / "assets" / "sfx"
+INTRO_SFX_VOLUME = 0.32
+INTRO_SFX_RANDOM_TOP_K = 3
