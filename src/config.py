@@ -1,7 +1,47 @@
 from pathlib import Path
+import os
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_local_env() -> None:
+    env_path = BASE_DIR / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+_load_local_env()
 
 # Foldere proiect
 INPUT_DIR = BASE_DIR / "input"
@@ -58,18 +98,34 @@ RETENTION_MAX_CLIP_DURATION = 60.0
 RETENTION_MIN_FINAL_SCORE = 55
 
 # --------------------------------------------------
+# Gemini Highlight Judge
+# --------------------------------------------------
+# legacy = numai selectorul actual
+# gemini = selector actual -> Gemini multimodal -> rerank/refine -> downstream
+# compare = rulează Gemini și salvează raport, dar downstream rămâne pe legacy
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_ENABLED = _env_bool("GEMINI_ENABLED", True)
+HIGHLIGHT_MODE = os.getenv("HIGHLIGHT_MODE", "legacy").strip().lower()
+CONTENT_PROFILE = os.getenv("CONTENT_PROFILE", "auto").strip().lower()
+GEMINI_CONTEXT_BEFORE = _env_float("GEMINI_CONTEXT_BEFORE", 8.0)
+GEMINI_CONTEXT_AFTER = _env_float("GEMINI_CONTEXT_AFTER", 8.0)
+GEMINI_MAX_CANDIDATES = _env_int("GEMINI_MAX_CANDIDATES", 60)
+GEMINI_TOP_HIGHLIGHTS = _env_int("GEMINI_TOP_HIGHLIGHTS", 10)
+GEMINI_MIN_SCORE = _env_int("GEMINI_MIN_SCORE", 55)
+GEMINI_OVERLAP_THRESHOLD = _env_float("GEMINI_OVERLAP_THRESHOLD", 0.60)
+GEMINI_MAX_RETRIES = _env_int("GEMINI_MAX_RETRIES", 2)
+GEMINI_PROMPT_VERSION = "gemini-highlight-v1"
+GEMINI_CACHE_DIR = BASE_DIR / "cache" / "gemini_highlights"
+
+# --------------------------------------------------
 # AI Voice-Over Hooks
 # --------------------------------------------------
 VOICEOVER_ENABLED = True
-
-# Hook generat în aceeași limbă ca sursa; poți forța "ro" sau "en".
 HOOK_LANGUAGE = "auto"
 VOICEOVER_MAX_HOOK_WORDS = 20
 VOICEOVER_MIN_HOOK_SCORE = 60
 VOICEOVER_MAX_DURATION = 4.0
-
-# Provider implicit fără dependențe Python suplimentare pe Windows.
-# Alternative: "piper" pentru TTS neural local.
 VOICEOVER_TTS_PROVIDER = "kokoro"
 VOICEOVER_VOICE = ""
 
@@ -79,7 +135,6 @@ VOICEOVER_KOKORO_DEVICE = "auto"
 VOICEOVER_KOKORO_SPEED = 1.10
 VOICEOVER_KOKORO_DEFAULT_LANGUAGE = "en"
 VOICEOVER_KOKORO_FALLBACK_PROVIDER = "windows_sapi"
-
 VOICEOVER_KOKORO_VOICE_EN = "af_heart"
 VOICEOVER_KOKORO_VOICE_EN_GB = "bf_emma"
 VOICEOVER_KOKORO_VOICE_ES = "ef_dora"
@@ -106,9 +161,6 @@ VOICEOVER_AUDIO_FADE = 0.20
 # --------------------------------------------------
 # Smart Intro SFX
 # --------------------------------------------------
-# Pune propriile fișiere în assets/sfx. Numele fișierului este metadata:
-# whoosh_fast_reveal.mp3, impact_gaming_clutch.mp3,
-# whoosh_soft_storytelling.mp3, pop_funny_comedy.mp3 etc.
 INTRO_SFX_ENABLED = True
 INTRO_SFX_DIR = BASE_DIR / "assets" / "sfx"
 INTRO_SFX_VOLUME = 0.30
