@@ -11,6 +11,7 @@ highlights/
 subtitles/
 scenes/
 logs/
+cache/
 
 *.mp4
 *.mkv
