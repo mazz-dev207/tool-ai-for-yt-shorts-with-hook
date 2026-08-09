@@ -14,7 +14,13 @@ from src.config import (
     HIGHLIGHTS_DIR,
     TRANSCRIPT_DIR,
 )
-from src.highlights.gemini_judge import GeminiHighlightJudge, GeminiUnavailable, probe_duration
+from src.highlights.gemini_judge import (
+    GeminiHighlightJudge,
+    GeminiQuotaExhausted,
+    GeminiUnavailable,
+    get_cached_judgement,
+    probe_duration,
+)
 from src.highlights.profiles import infer_profile
 from src.highlights.ranking import diversity_rerank, remove_overlaps
 from src.logger import info, success, warning
@@ -68,6 +74,86 @@ def _merge_judgement(candidate: dict, judgement: dict, profile_name: str, model_
     return item
 
 
+def _rejection_reason(judgement: dict) -> str | None:
+    if not bool(judgement.get("recommended", False)):
+        return "gemini_not_recommended"
+    if int(judgement.get("total_score", 0) or 0) < GEMINI_MIN_SCORE:
+        return "below_min_score"
+    return None
+
+
+def _ids(items: list[dict]) -> set[int]:
+    result: set[int] = set()
+    for item in items:
+        try:
+            result.add(int(item.get("candidate_id", 0)))
+        except (TypeError, ValueError):
+            pass
+    return result
+
+
+def _report_entry(item: dict, status: str, rejection_reason: str | None = None) -> dict:
+    gemini = item.get("gemini") or {}
+    refined_start = gemini.get("refined_start")
+    refined_end = gemini.get("refined_end")
+    refined_duration = None
+    if refined_start is not None and refined_end is not None:
+        refined_duration = round(float(refined_end) - float(refined_start), 3)
+
+    return {
+        "candidate_id": item.get("candidate_id"),
+        "title": item.get("title"),
+        "legacy_start": gemini.get("original_start", item.get("start")),
+        "legacy_end": gemini.get("original_end", item.get("end")),
+        "legacy_score": round(_legacy_score(item), 2),
+        "refined_start": refined_start,
+        "refined_end": refined_end,
+        "refined_duration": refined_duration,
+        "gemini_score": gemini.get("total_score"),
+        "scores": gemini.get("scores"),
+        "category": gemini.get("category"),
+        "reason": gemini.get("reason"),
+        "has_complete_payoff": gemini.get("has_complete_payoff"),
+        "requires_previous_context": gemini.get("requires_previous_context"),
+        "recommended": gemini.get("recommended"),
+        "content_profile": gemini.get("content_profile"),
+        "ai_model": gemini.get("ai_model"),
+        "status": status,
+        "rejection_reason": rejection_reason,
+        "minimum_required_score": GEMINI_MIN_SCORE,
+    }
+
+
+def _failure_entry(candidate: dict, status: str, error: str) -> dict:
+    return {
+        "candidate_id": candidate.get("candidate_id"),
+        "title": candidate.get("title"),
+        "start": candidate.get("start"),
+        "end": candidate.get("end"),
+        "legacy_score": _legacy_score(candidate),
+        "status": status,
+        "error": error,
+    }
+
+
+def _record_judgement(
+    candidate: dict,
+    judgement: dict,
+    profile_name: str,
+    model_name: str,
+    evaluated: list[dict],
+    qualified: list[dict],
+    rejected: list[dict],
+) -> None:
+    merged = _merge_judgement(candidate, judgement, profile_name, model_name)
+    evaluated.append(merged)
+    reason = _rejection_reason(judgement)
+    if reason is None:
+        qualified.append(merged)
+    else:
+        rejected.append(_report_entry(merged, "rejected", reason))
+
+
 def run_gemini_highlight_stage(
     video_name: str,
     video_path: Path,
@@ -83,11 +169,9 @@ def run_gemini_highlight_stage(
     if selected_mode not in {"legacy", "gemini", "compare"}:
         warning(f"Highlight mode necunoscut '{selected_mode}', folosesc legacy.")
         selected_mode = "legacy"
-
     if selected_mode == "legacy":
         info("[GEMINI] Highlight mode=legacy; păstrez selectorul existent.")
         return highlights_path
-
     if not GEMINI_ENABLED:
         warning("[GEMINI] Dezactivat; continui cu selectorul legacy.")
         return highlights_path
@@ -113,9 +197,13 @@ def run_gemini_highlight_stage(
         return highlights_path
 
     video_duration = probe_duration(video_path)
-    judged: list[dict] = []
-    failures = 0
+    evaluated: list[dict] = []
+    qualified: list[dict] = []
+    rejected: list[dict] = []
+    failure_items: list[dict] = []
+    skipped_quota_items: list[dict] = []
     cache_hits = 0
+    quota_exhausted = False
 
     info("[GEMINI] Evaluating candidates multimodal...")
     for index, candidate in enumerate(candidates, start=1):
@@ -138,43 +226,133 @@ def run_gemini_highlight_stage(
                 f"[GEMINI {index}/{len(candidates)}] score={judgement['total_score']} "
                 f"category={judgement['category']} cache={'hit' if from_cache else 'miss'}"
             )
-            if judgement["recommended"] and int(judgement["total_score"]) >= GEMINI_MIN_SCORE:
-                judged.append(_merge_judgement(candidate, judgement, profile.name, GEMINI_MODEL))
-        except Exception as exc:
-            failures += 1
-            warning(f"[GEMINI {index}/{len(candidates)}] failed: {exc}")
+            _record_judgement(
+                candidate,
+                judgement,
+                profile.name,
+                GEMINI_MODEL,
+                evaluated,
+                qualified,
+                rejected,
+            )
 
-    if not judged:
-        warning("[GEMINI] Niciun rezultat valid; fallback complet la selectorul legacy.")
-        _save_json(
-            HIGHLIGHTS_DIR / f"{video_name}_gemini_metadata.json",
-            {
-                "video": video_path.name,
-                "mode": selected_mode,
-                "fallback": "legacy",
-                "evaluated": len(candidates),
-                "failures": failures,
-                "cache_hits": cache_hits,
-            },
-        )
-        return highlights_path
+        except GeminiQuotaExhausted as exc:
+            quota_exhausted = True
+            warning(
+                f"[GEMINI {index}/{len(candidates)}] daily quota exhausted: {exc}"
+            )
+            warning(
+                "[GEMINI] Oprire API Gemini; verific cache-ul local pentru candidații rămași."
+            )
+            failure_items.append(
+                _failure_entry(candidate, "failed_quota", str(exc))
+            )
+
+            for remaining_index, remaining in enumerate(
+                candidates[index:], start=index + 1
+            ):
+                remaining_profile = infer_profile(
+                    remaining, content_profile or CONTENT_PROFILE
+                )
+                try:
+                    cached = get_cached_judgement(
+                        video_path, remaining, remaining_profile
+                    )
+                except Exception as cache_exc:
+                    warning(
+                        f"[GEMINI {remaining_index}/{len(candidates)}] cache check failed: {cache_exc}"
+                    )
+                    cached = None
+
+                if cached is None:
+                    skipped_quota_items.append(
+                        _failure_entry(
+                            remaining,
+                            "skipped_quota",
+                            "Gemini daily quota exhausted and no cached judgement exists",
+                        )
+                    )
+                    continue
+
+                cache_hits += 1
+                info(
+                    f"[GEMINI {remaining_index}/{len(candidates)}] "
+                    f"score={cached['total_score']} category={cached['category']} "
+                    "cache=hit (quota-safe)"
+                )
+                _record_judgement(
+                    remaining,
+                    cached,
+                    remaining_profile.name,
+                    GEMINI_MODEL,
+                    evaluated,
+                    qualified,
+                    rejected,
+                )
+            break
+
+        except Exception as exc:
+            warning(f"[GEMINI {index}/{len(candidates)}] failed: {exc}")
+            failure_items.append(_failure_entry(candidate, "failed", str(exc)))
 
     info("[RANKING] Removing overlapping candidates...")
-    deduped = remove_overlaps(judged, threshold=GEMINI_OVERLAP_THRESHOLD)
+    deduped = remove_overlaps(qualified, threshold=GEMINI_OVERLAP_THRESHOLD)
     final = diversity_rerank(deduped, top_k=GEMINI_TOP_HIGHLIGHTS)
-
     for rank, item in enumerate(final, start=1):
         item["rank"] = rank
+
+    deduped_ids = _ids(deduped)
+    final_ids = _ids(final)
+    selected_report: list[dict] = []
+    removed_overlap: list[dict] = []
+    ranked_out: list[dict] = []
+
+    for item in qualified:
+        candidate_id = int(item.get("candidate_id", 0))
+        if candidate_id in final_ids:
+            selected_report.append(_report_entry(item, "selected"))
+        elif candidate_id not in deduped_ids:
+            removed_overlap.append(
+                _report_entry(item, "removed_overlap", "overlap_with_higher_scoring_candidate")
+            )
+        else:
+            ranked_out.append(_report_entry(item, "ranked_out", "outside_final_top_k"))
+
+    selected_ids = _ids(selected_report)
+    overlap_ids = _ids(removed_overlap)
+    ranked_out_ids = _ids(ranked_out)
+    all_evaluated: list[dict] = []
+    for item in evaluated:
+        candidate_id = int(item.get("candidate_id", 0))
+        if candidate_id in selected_ids:
+            status, reason = "selected", None
+        elif candidate_id in overlap_ids:
+            status, reason = "removed_overlap", "overlap_with_higher_scoring_candidate"
+        elif candidate_id in ranked_out_ids:
+            status, reason = "ranked_out", "outside_final_top_k"
+        else:
+            status, reason = "rejected", _rejection_reason(item.get("gemini") or {})
+        all_evaluated.append(_report_entry(item, status, reason))
+
+    all_evaluated.sort(key=lambda item: int(item.get("gemini_score", 0) or 0), reverse=True)
+    api_attempted_count = max(0, len(evaluated) - cache_hits) + len(failure_items)
 
     metadata = {
         "video": video_path.name,
         "mode": selected_mode,
         "ai_model": GEMINI_MODEL,
         "legacy_candidate_count": len(legacy_candidates),
-        "gemini_evaluated_count": len(candidates),
-        "gemini_qualified_count": len(judged),
+        "gemini_attempted_count": len(evaluated) + len(failure_items),
+        "gemini_api_attempted_count": api_attempted_count,
+        "gemini_evaluated_count": len(evaluated),
+        "gemini_qualified_count": len(qualified),
+        "gemini_rejected_count": len(rejected),
+        "removed_overlap_count": len(removed_overlap),
+        "ranked_out_count": len(ranked_out),
         "selected_count": len(final),
-        "failures": failures,
+        "failures": len(failure_items),
+        "quota_exhausted": quota_exhausted,
+        "quota_skipped_count": len(skipped_quota_items),
         "cache_hits": cache_hits,
         "highlights": [
             {
@@ -201,6 +379,12 @@ def run_gemini_highlight_stage(
             }
             for item in final
         ],
+        "all_evaluated": all_evaluated,
+        "rejected": rejected,
+        "removed_overlap": removed_overlap,
+        "ranked_out": ranked_out,
+        "failed": failure_items,
+        "skipped_quota": skipped_quota_items,
     }
     _save_json(HIGHLIGHTS_DIR / f"{video_name}_gemini_metadata.json", metadata)
 
@@ -209,14 +393,47 @@ def run_gemini_highlight_stage(
             HIGHLIGHTS_DIR / f"{video_name}_highlight_compare.json",
             {
                 "video": video_path.name,
+                "mode": "compare",
+                "ai_model": GEMINI_MODEL,
                 "legacy": legacy_candidates,
                 "gemini": final,
+                "gemini_selected": selected_report,
+                "gemini_rejected": rejected,
+                "gemini_removed_overlap": removed_overlap,
+                "gemini_ranked_out": ranked_out,
+                "gemini_failed": failure_items,
+                "gemini_skipped_quota": skipped_quota_items,
+                "gemini_all_evaluated": all_evaluated,
+                "summary": {
+                    "legacy_candidates": len(legacy_candidates),
+                    "attempted": len(evaluated) + len(failure_items),
+                    "api_attempted": api_attempted_count,
+                    "evaluated": len(evaluated),
+                    "qualified": len(qualified),
+                    "selected": len(final),
+                    "rejected": len(rejected),
+                    "removed_overlap": len(removed_overlap),
+                    "ranked_out": len(ranked_out),
+                    "failed": len(failure_items),
+                    "quota_exhausted": quota_exhausted,
+                    "skipped_quota": len(skipped_quota_items),
+                    "cache_hits": cache_hits,
+                },
             },
         )
-        success(
-            f"[COMPARE] Raport salvat; downstream rămâne pe legacy. "
-            f"Gemini selected {len(final)} highlights."
+        quota_note = (
+            f" | quota exhausted, skipped {len(skipped_quota_items)} without cache"
+            if quota_exhausted
+            else ""
         )
+        success(
+            f"[COMPARE] Raport complet salvat; downstream rămâne pe legacy. "
+            f"Gemini selected {len(final)} din {len(evaluated)} evaluate{quota_note}."
+        )
+        return highlights_path
+
+    if not final:
+        warning("[GEMINI] Niciun rezultat Gemini nu a trecut ranking-ul; fallback complet la selectorul legacy.")
         return highlights_path
 
     _save_json(highlights_path, final)
