@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from src.highlights.profiles import get_profile
@@ -12,6 +13,14 @@ from src.highlights.ranking import (
 
 
 class GeminiHighlightTests(unittest.TestCase):
+    def test_valid_json_parses(self):
+        value = json.loads('{"candidate_id": 1, "recommended": true}')
+        self.assertEqual(value["candidate_id"], 1)
+
+    def test_invalid_json_raises(self):
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads('{"candidate_id":')
+
     def test_score_validation_clamps_ranges(self):
         scores = validate_scores({
             "hook": 99,
