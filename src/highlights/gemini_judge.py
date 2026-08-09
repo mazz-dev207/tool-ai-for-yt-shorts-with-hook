@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -62,6 +63,49 @@ RESPONSE_SCHEMA = {
 
 class GeminiUnavailable(RuntimeError):
     pass
+
+
+class GeminiQuotaExhausted(RuntimeError):
+    """Raised when the project/model daily Gemini quota is exhausted."""
+
+
+def _error_text(exc: Exception) -> str:
+    return str(exc or "").lower()
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    text = _error_text(exc)
+    return "429" in text or "resource_exhausted" in text
+
+
+def _is_daily_quota_exhausted(exc: Exception) -> bool:
+    text = _error_text(exc)
+    if not _is_rate_limit_error(exc):
+        return False
+
+    daily_markers = (
+        "generaterequestsperdayperprojectpermodel-freetier",
+        "requestsperday",
+        "requests per day",
+    )
+    return "quota" in text and any(marker in text for marker in daily_markers)
+
+
+def _retry_delay_seconds(exc: Exception, default: float) -> float:
+    """Extract Gemini's suggested retry delay, falling back to our backoff."""
+    text = str(exc or "")
+    patterns = (
+        r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s",
+        r"retry\s+in\s+(\d+(?:\.\d+)?)s",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            try:
+                return max(0.0, min(120.0, float(match.group(1))))
+            except (TypeError, ValueError):
+                break
+    return max(0.0, min(120.0, float(default)))
 
 
 def _run(command: list[str]) -> None:
@@ -274,9 +318,13 @@ class GeminiHighlightJudge:
             candidate_id, candidate, transcript_text, profile, context_start, context_end
         )
 
+        max_attempts = max(1, GEMINI_MAX_RETRIES)
         last_error: Exception | None = None
-        for attempt in range(1, max(1, GEMINI_MAX_RETRIES) + 1):
+
+        for attempt in range(1, max_attempts + 1):
             uploaded = None
+            retry_delay: float | None = None
+
             try:
                 uploaded = self.client.files.upload(file=str(context_video))
                 uploaded = self._wait_until_active(uploaded)
@@ -301,15 +349,33 @@ class GeminiHighlightJudge:
                 )
                 _save_cache(cache_key, validated)
                 return validated, False
+
             except Exception as exc:
                 last_error = exc
-                if attempt < max(1, GEMINI_MAX_RETRIES):
-                    time.sleep(min(2 ** attempt, 6))
+
+                if _is_daily_quota_exhausted(exc):
+                    raise GeminiQuotaExhausted(
+                        f"Gemini daily quota exhausted for model {GEMINI_MODEL}"
+                    ) from exc
+
+                if attempt < max_attempts:
+                    fallback_delay = min(2 ** attempt, 6)
+                    if _is_rate_limit_error(exc):
+                        retry_delay = _retry_delay_seconds(exc, fallback_delay)
+                    else:
+                        retry_delay = float(fallback_delay)
+
             finally:
                 if uploaded is not None:
                     try:
                         self.client.files.delete(name=uploaded.name)
                     except Exception:
                         pass
+
+            if retry_delay is not None:
+                time.sleep(retry_delay)
+                continue
+
+            break
 
         raise RuntimeError(f"Gemini judge failed after retries: {last_error}")
