@@ -8,6 +8,7 @@ from src.config import (
     TEMP_DIR,
     VIDEO_WIDTH,
     VIDEO_HEIGHT,
+    SMARTCROP_WEBCAM_PERSISTENCE,
 )
 from src.logger import info, success, warning
 from src.smart_crop import write_sendcmd, initial_crop_xy
@@ -49,6 +50,55 @@ def _encode_args(output: Path) -> list[str]:
         "-movflags", "+faststart",
         str(output),
     ]
+
+
+def _webcam_corner(plan) -> str:
+    webcam = plan.webcam_region
+    if webcam is None:
+        return "none"
+
+    center_x = webcam.x + webcam.w / 2
+    center_y = webcam.y + webcam.h / 2
+    horizontal = "left" if center_x < plan.input_width / 2 else "right"
+    vertical = "top" if center_y < plan.input_height / 2 else "bottom"
+    return f"{vertical}-{horizontal}"
+
+
+def _log_smartcrop_decision(plan) -> None:
+    info(
+        f"[SMARTCROP] Detected mode: {plan.mode} | "
+        f"confidence={float(plan.confidence):.2f} | "
+        f"source={plan.input_width}x{plan.input_height}"
+    )
+
+    if plan.mode == "GAMEPLAY_WEBCAM" and plan.webcam_region is not None:
+        webcam = plan.webcam_region
+        info(
+            f"[SMARTCROP] Webcam: {_webcam_corner(plan)} | "
+            f"bbox=x{webcam.x},y{webcam.y},w{webcam.w},h{webcam.h}"
+        )
+        info(
+            f"[SMARTCROP] Layout: GAMEPLAY_TOP_WEBCAM_BOTTOM | "
+            f"gameplay={VIDEO_WIDTH}x{plan.gameplay_output_height} | "
+            f"webcam={VIDEO_WIDTH}x{plan.webcam_output_height}"
+        )
+
+        motion_samples = sum(
+            1 for point in plan.focus_points
+            if getattr(point, "source", "") == "motion"
+        )
+        info(
+            f"[SMARTCROP] Tracking: focus_samples={len(plan.focus_points)} | "
+            f"motion_samples={motion_samples} | "
+            f"reaction_signals={len(plan.reaction_events)}"
+        )
+        return
+
+    info(
+        "[SMARTCROP] Using existing SmartCrop fallback | "
+        f"persistent_webcam_confidence={float(plan.confidence):.2f} | "
+        f"required={SMARTCROP_WEBCAM_PERSISTENCE:.2f}"
+    )
 
 
 def _render_legacy(video: Path, subtitle: Path, output: Path, plan, clip_name: str) -> None:
@@ -122,13 +172,11 @@ def render(clip_name: str):
 
     info(f"[SMARTCROP] Analysing visual layout for {clip_name}")
     plan = analyze_smart_crop_v2(video)
+    _log_smartcrop_decision(plan)
     save_smartcrop_debug(clip_name, plan)
 
     if plan.mode == "GAMEPLAY_WEBCAM":
         try:
-            info("[SMARTCROP] Layout: GAMEPLAY_TOP_WEBCAM_BOTTOM")
-            if plan.reaction_events:
-                info(f"[SMARTCROP] Reaction signals detected: {len(plan.reaction_events)}")
             _render_gameplay_webcam(video, subtitle, output, plan, clip_name)
             success(f"Clip randat: {output.name}")
             return output
