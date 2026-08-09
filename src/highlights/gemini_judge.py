@@ -297,6 +297,7 @@ class GeminiHighlightJudge:
                     profile=profile,
                     context_start=context_start,
                     context_end=context_end,
+                    transcript=transcript,
                 )
                 _save_cache(cache_key, validated)
                 return validated, False
