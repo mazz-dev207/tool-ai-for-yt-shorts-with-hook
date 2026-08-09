@@ -18,6 +18,7 @@ from src.highlights.gemini_judge import (
     GeminiHighlightJudge,
     GeminiQuotaExhausted,
     GeminiUnavailable,
+    get_cached_judgement,
     probe_duration,
 )
 from src.highlights.profiles import infer_profile
@@ -135,6 +136,24 @@ def _failure_entry(candidate: dict, status: str, error: str) -> dict:
     }
 
 
+def _record_judgement(
+    candidate: dict,
+    judgement: dict,
+    profile_name: str,
+    model_name: str,
+    evaluated: list[dict],
+    qualified: list[dict],
+    rejected: list[dict],
+) -> None:
+    merged = _merge_judgement(candidate, judgement, profile_name, model_name)
+    evaluated.append(merged)
+    reason = _rejection_reason(judgement)
+    if reason is None:
+        qualified.append(merged)
+    else:
+        rejected.append(_report_entry(merged, "rejected", reason))
+
+
 def run_gemini_highlight_stage(
     video_name: str,
     video_path: Path,
@@ -207,14 +226,15 @@ def run_gemini_highlight_stage(
                 f"[GEMINI {index}/{len(candidates)}] score={judgement['total_score']} "
                 f"category={judgement['category']} cache={'hit' if from_cache else 'miss'}"
             )
-
-            merged = _merge_judgement(candidate, judgement, profile.name, GEMINI_MODEL)
-            evaluated.append(merged)
-            reason = _rejection_reason(judgement)
-            if reason is None:
-                qualified.append(merged)
-            else:
-                rejected.append(_report_entry(merged, "rejected", reason))
+            _record_judgement(
+                candidate,
+                judgement,
+                profile.name,
+                GEMINI_MODEL,
+                evaluated,
+                qualified,
+                rejected,
+            )
 
         except GeminiQuotaExhausted as exc:
             quota_exhausted = True
@@ -222,19 +242,52 @@ def run_gemini_highlight_stage(
                 f"[GEMINI {index}/{len(candidates)}] daily quota exhausted: {exc}"
             )
             warning(
-                "[GEMINI] Opresc evaluările Gemini rămase; pipeline-ul continuă cu rezultatele disponibile/fallback legacy."
+                "[GEMINI] Oprire API Gemini; verific cache-ul local pentru candidații rămași."
             )
             failure_items.append(
                 _failure_entry(candidate, "failed_quota", str(exc))
             )
 
-            for skipped in candidates[index:]:
-                skipped_quota_items.append(
-                    _failure_entry(
-                        skipped,
-                        "skipped_quota",
-                        "Gemini daily quota exhausted before this candidate was attempted",
+            for remaining_index, remaining in enumerate(
+                candidates[index:], start=index + 1
+            ):
+                remaining_profile = infer_profile(
+                    remaining, content_profile or CONTENT_PROFILE
+                )
+                try:
+                    cached = get_cached_judgement(
+                        video_path, remaining, remaining_profile
                     )
+                except Exception as cache_exc:
+                    warning(
+                        f"[GEMINI {remaining_index}/{len(candidates)}] cache check failed: {cache_exc}"
+                    )
+                    cached = None
+
+                if cached is None:
+                    skipped_quota_items.append(
+                        _failure_entry(
+                            remaining,
+                            "skipped_quota",
+                            "Gemini daily quota exhausted and no cached judgement exists",
+                        )
+                    )
+                    continue
+
+                cache_hits += 1
+                info(
+                    f"[GEMINI {remaining_index}/{len(candidates)}] "
+                    f"score={cached['total_score']} category={cached['category']} "
+                    "cache=hit (quota-safe)"
+                )
+                _record_judgement(
+                    remaining,
+                    cached,
+                    remaining_profile.name,
+                    GEMINI_MODEL,
+                    evaluated,
+                    qualified,
+                    rejected,
                 )
             break
 
@@ -282,6 +335,7 @@ def run_gemini_highlight_stage(
         all_evaluated.append(_report_entry(item, status, reason))
 
     all_evaluated.sort(key=lambda item: int(item.get("gemini_score", 0) or 0), reverse=True)
+    api_attempted_count = max(0, len(evaluated) - cache_hits) + len(failure_items)
 
     metadata = {
         "video": video_path.name,
@@ -289,6 +343,7 @@ def run_gemini_highlight_stage(
         "ai_model": GEMINI_MODEL,
         "legacy_candidate_count": len(legacy_candidates),
         "gemini_attempted_count": len(evaluated) + len(failure_items),
+        "gemini_api_attempted_count": api_attempted_count,
         "gemini_evaluated_count": len(evaluated),
         "gemini_qualified_count": len(qualified),
         "gemini_rejected_count": len(rejected),
@@ -352,6 +407,7 @@ def run_gemini_highlight_stage(
                 "summary": {
                     "legacy_candidates": len(legacy_candidates),
                     "attempted": len(evaluated) + len(failure_items),
+                    "api_attempted": api_attempted_count,
                     "evaluated": len(evaluated),
                     "qualified": len(qualified),
                     "selected": len(final),
@@ -366,7 +422,7 @@ def run_gemini_highlight_stage(
             },
         )
         quota_note = (
-            f" | quota exhausted, skipped {len(skipped_quota_items)}"
+            f" | quota exhausted, skipped {len(skipped_quota_items)} without cache"
             if quota_exhausted
             else ""
         )
