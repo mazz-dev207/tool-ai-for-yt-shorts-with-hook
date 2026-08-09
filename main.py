@@ -97,7 +97,7 @@ def main():
     _, timings["candidate_discovery"] = timed_step(
         generate_candidates,
         video_name,
-        args.highlight_mode in {"gemini", "compare"},
+        args.highlight_mode == "gemini",
     )
     _, timings["gemini_judge"] = timed_step(
         run_gemini_highlight_stage,
