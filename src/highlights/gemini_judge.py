@@ -216,6 +216,14 @@ def _save_cache(key: str, value: dict) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def get_cached_judgement(
+    video_path: Path,
+    candidate: dict,
+    profile: ContentProfile,
+) -> dict | None:
+    return _load_cache(_cache_key(video_path, candidate, profile))
+
+
 def build_prompt(
     candidate_id: int,
     candidate: dict,
@@ -305,11 +313,11 @@ class GeminiHighlightJudge:
         profile: ContentProfile,
         video_duration: float,
     ) -> tuple[dict, bool]:
-        cache_key = _cache_key(video_path, candidate, profile)
-        cached = _load_cache(cache_key)
+        cached = get_cached_judgement(video_path, candidate, profile)
         if cached is not None:
             return cached, True
 
+        cache_key = _cache_key(video_path, candidate, profile)
         context_video, context_start, context_end = extract_context_video(
             video_path, candidate, video_duration, candidate_id
         )
