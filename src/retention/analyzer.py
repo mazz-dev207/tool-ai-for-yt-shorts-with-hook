@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 
 import ollama
 
 from src.config import OLLAMA_MODEL, HOOK_LANGUAGE, VOICEOVER_MAX_HOOK_WORDS
-from src.logger import info
+from src.logger import info, warning
 from src.retention.context import format_context_for_llm
 
 
@@ -16,8 +17,47 @@ CONTENT_TYPES = (
 )
 
 RETENTION_NUM_CTX = 4096
-RETENTION_NUM_PREDICT = 1100
+RETENTION_NUM_PREDICT = 1400
 OLLAMA_KEEP_ALIVE = "30m"
+
+
+def parse_retention_json(content: str) -> dict:
+    text = str(content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+
+    candidates = [text]
+    first = text.find("{")
+    last = text.rfind("}")
+    if first >= 0 and last > first:
+        candidates.append(text[first:last + 1])
+
+    last_error: Exception | None = None
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        attempts = [
+            candidate,
+            re.sub(r",\s*([}\]])", r"\1", candidate),
+        ]
+        for attempt in attempts:
+            try:
+                result = json.loads(attempt)
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+            try:
+                result, _end = decoder.raw_decode(attempt.lstrip())
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+    raise RuntimeError(f"Retention AI a returnat JSON invalid: {last_error}")
 
 
 class RetentionAnalyzer:
@@ -153,18 +193,14 @@ TIMESTAMPED TRANSCRIPT:
             f"Retention AI răspuns în {elapsed:.2f}s | load={load_ms:.0f}ms | "
             f"in={prompt_tokens} tok | out={output_tokens} tok"
         )
+        if output_tokens >= RETENTION_NUM_PREDICT - 5:
+            warning(
+                "[RETENTION] Răspunsul a atins limita de output; "
+                "parser-ul va încerca recuperarea JSON-ului."
+            )
 
-        content = response["message"]["content"].strip()
-        try:
-            result = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Retention AI a returnat JSON invalid: {exc}") from exc
+        result = parse_retention_json(response["message"]["content"])
 
-        if not isinstance(result, dict):
-            raise RuntimeError("Retention AI nu a returnat un obiect JSON.")
-
-        # Compatibilitate cu optimizer-ul existent fără să cerem modelului
-        # să consume tokeni pentru metadata nefolosită la editare/voice-over.
         result.setdefault("retention_anchors", [])
         result.setdefault("retention_risks", [])
         result.setdefault("open_loops", [])
