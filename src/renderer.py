@@ -85,11 +85,12 @@ def _render_gameplay_webcam(video: Path, subtitle: Path, output: Path, plan, cli
     webcam = plan.webcam_region
 
     filter_complex = (
-        f"[0:v]sendcmd=f='{command_path}',"
+        "[0:v]split=2[game_src][cam_src];"
+        f"[game_src]sendcmd=f='{command_path}',"
         f"crop@gameplay=w={plan.gameplay_crop_width}:h={plan.gameplay_crop_height}:"
         f"x={initial_x}:y={initial_y},"
         f"scale={VIDEO_WIDTH}:{plan.gameplay_output_height}[gameplay];"
-        f"[0:v]crop=w={webcam.w}:h={webcam.h}:x={webcam.x}:y={webcam.y},"
+        f"[cam_src]crop=w={webcam.w}:h={webcam.h}:x={webcam.x}:y={webcam.y},"
         f"scale={VIDEO_WIDTH}:{plan.webcam_output_height}:force_original_aspect_ratio=decrease,"
         f"pad={VIDEO_WIDTH}:{plan.webcam_output_height}:(ow-iw)/2:(oh-ih)/2[webcam];"
         f"[gameplay][webcam]vstack=inputs=2,"
