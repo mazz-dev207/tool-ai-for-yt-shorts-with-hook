@@ -20,7 +20,7 @@ from src.config import (
 from src.logger import info, success
 from src.transcribe import transcribe
 from src.chunk_transcript import chunk_transcript
-from src.highlight_selector import select_highlights
+from src.highlights.candidate_generator import generate_candidates
 from src.highlights.gemini_pipeline import run_gemini_highlight_stage
 from src.retention.optimizer import optimize_retention
 from src.cut import cut
@@ -94,7 +94,11 @@ def main():
     _, timings["chunking"] = timed_step(chunk_transcript, video_name)
 
     info("3/8 Candidate discovery...")
-    _, timings["candidate_discovery"] = timed_step(select_highlights, video_name)
+    _, timings["candidate_discovery"] = timed_step(
+        generate_candidates,
+        video_name,
+        args.highlight_mode in {"gemini", "compare"},
+    )
     _, timings["gemini_judge"] = timed_step(
         run_gemini_highlight_stage,
         video_name,
